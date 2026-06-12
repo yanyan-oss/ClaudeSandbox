@@ -1,0 +1,181 @@
+name: 🤖 AI Coach — 大师点评
+
+on:
+  push:
+    paths:
+      - 'ClaudeSandbox/chat-logs/**.md'
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  coach:
+    name: DeepSeek-R1 大师点评
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip-coach]') }}
+
+    steps:
+      - name: 📥 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔍 查找变更的 Markdown 文件
+        id: changed
+        run: |
+          echo "=== 扫描 ClaudeSandbox/chat-logs/ 下变更的 .md 文件 ==="
+
+          # 获取本次 push 中变更的 md 文件
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            FILES=$(git diff --name-only HEAD~1 HEAD -- 'ClaudeSandbox/chat-logs/**.md' 2>/dev/null || true)
+          else
+            # 首次提交：对比空树
+            FILES=$(git diff-tree --no-commit-id --name-only -r HEAD -- 'ClaudeSandbox/chat-logs/**.md' 2>/dev/null || true)
+          fi
+
+          FILES=$(echo "$FILES" | grep '\.md$' || true)
+
+          if [ -z "$FILES" ]; then
+            echo "⚠️ 未检测到 .md 文件变更，跳过。"
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "📄 检测到以下文件变更："
+          echo "$FILES"
+          echo "has_files=true" >> "$GITHUB_OUTPUT"
+
+          # 将文件列表写入临时文件供后续循环使用
+          echo "$FILES" > /tmp/changed_md_files.txt
+
+      - name: 🧠 逐文件调用 DeepSeek-R1 生成大师点评
+        if: steps.changed.outputs.has_files == 'true'
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          ANY_CHANGED=false
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+            echo ""
+            echo "============================================"
+            echo "📝 处理文件: $FILE"
+            echo "============================================"
+
+            # ———— 1. 清除历史反馈 ————
+            # 删除所有以 "## 🤖 " 或 "> 🤖 " 开头的行到文末
+            # 同时处理可能的多种历史标记格式
+            sed -i '/^## 🤖 /,$d' "$FILE"  2>/dev/null || true
+            sed -i '/^> 🤖 /,$d' "$FILE"   2>/dev/null || true
+            sed -i '/^# 🤖 /,$d' "$FILE"   2>/dev/null || true
+
+            # ———— 2. 读取笔记内容 ————
+            CONTENT=$(cat "$FILE")
+            WORD_COUNT=$(echo "$CONTENT" | wc -m)
+
+            if [ "$WORD_COUNT" -lt 10 ]; then
+              echo "⏭️  文件内容过短（${WORD_COUNT} 字符），跳过。"
+              continue
+            fi
+
+            echo "📖 读取到 ${WORD_COUNT} 字符内容"
+
+            # ———— 3. 构造 Prompt ————
+            PROMPT=$(cat <<PROMPT_EOF
+            你是一位拥有 30 年跨领域经验的大师级思考者。请仔细阅读以下笔记内容，
+            然后从三个不同维度（如：深度洞察、潜在盲区、行动建议、跨领域类比、
+            第一性原理追问、反直觉视角、系统思维等）中各选择一个最契合的维度，
+            输出 **精确 3 点** 大师级点评。
+
+            ## 输出格式要求（严格遵守）
+            1. 每条以 "> 🤖 **{维度名}：**" 开头
+            2. 每条不超过 120 字
+            3. 语言风格：精炼、犀利、有洞察力，不客套
+            4. 三条之间要有明显的视角差异
+
+            ## 笔记内容
+            $CONTENT
+            PROMPT_EOF
+            )
+
+            # ———— 4. 调用 DeepSeek-R1 ————
+            echo "🤖 正在调用 deepseek-reasoner ..."
+
+            RESPONSE=$(curl -s https://api.deepseek.com/chat/completions \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
+              -d "$(jq -n \
+                --arg content "$PROMPT" \
+                '{
+                  model: "deepseek-reasoner",
+                  messages: [
+                    {role: "system", content: "你是一位精炼的大师级思考者。只输出最终点评，不要任何前缀或解释。"},
+                    {role: "user", content: $content}
+                  ],
+                  temperature: 0.7,
+                  max_tokens: 600
+                }')" 2>&1)
+
+            # ———— 5. 解析响应 ————
+            INSIGHT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+
+            if [ -z "$INSIGHT" ] || [ "$INSIGHT" = "null" ]; then
+              echo "❌ API 返回为空，尝试输出原始响应用于调试："
+              echo "$RESPONSE" | head -20
+              echo "⚠️  跳过文件 $FILE"
+              continue
+            fi
+
+            echo "✅ 大师点评生成成功："
+            echo "$INSIGHT"
+
+            # ———— 6. 追加到原笔记末尾 ————
+            {
+              echo ""
+              echo "---"
+              echo ""
+              echo "## 🤖 大师点评 (DeepSeek-R1)"
+              echo ""
+              echo "$INSIGHT"
+              echo ""
+              echo "> 📅 点评时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M') (CST)"
+            } >> "$FILE"
+
+            echo "📌 已追加到: $FILE"
+            ANY_CHANGED=true
+
+          done < /tmp/changed_md_files.txt
+
+          echo "any_changed=$ANY_CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: 📤 提交并推送点评
+        if: steps.changed.outputs.has_files == 'true'
+        env:
+          ANY_CHANGED: ${{ steps.changed.outputs.any_changed }}
+        run: |
+          if [ "$ANY_CHANGED" != "true" ]; then
+            echo "⏭️  没有文件被修改，跳过提交。"
+            exit 0
+          fi
+
+          git config user.name  "AI Coach Bot"
+          git config user.email "coach-bot@ai.master"
+
+          git add 'ClaudeSandbox/chat-logs/**.md'
+
+          if git diff --cached --quiet; then
+            echo "⏭️  无实际内容变更，跳过提交。"
+            exit 0
+          fi
+
+          git commit -m "🤖 [skip-coach] DeepSeek-R1 大师点评已追加
+
+          - 触发文件数: $(wc -l < /tmp/changed_md_files.txt | tr -d ' ')
+          - 模型: deepseek-reasoner"
+
+          git push origin HEAD
+          echo "🚀 已推送点评！"

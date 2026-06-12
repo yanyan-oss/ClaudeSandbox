@@ -1,0 +1,23 @@
+{
+  "name": "skill-manager",
+  "version": "1.0.0",
+  "description": "GitHub 技能管理 · 命令行选单 — 轨藏 PPT 杂志风",
+  "type": "module",
+  "main": "skill-manager.js",
+  "scripts": {
+    "start": "node skill-manager.js"
+  },
+  "keywords": [
+    "cli",
+    "skill-manager",
+    "ppt",
+    "revealjs"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@inquirer/prompts": "^8.5.2",
+    "boxen": "^8.0.1",
+    "chalk": "^5.6.2",
+    "ora": "^9.4.0"
+  }
+}

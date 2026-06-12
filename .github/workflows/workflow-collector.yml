@@ -1,0 +1,247 @@
+name: 🗞️ AI Collector — 每日前沿快报
+
+on:
+  schedule:
+    # UTC 00:00 = 北京时间 08:00
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # 允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    name: 抓取 & 总结 AI 前沿资讯
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 检出仓库
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🌐 抓取 Hacker News 热门
+        id: fetch_hn
+        run: |
+          echo "=== 抓取 Hacker News Top 30 ==="
+
+          # 获取 Top 30 故事 ID
+          TOP_IDS=$(curl -s 'https://hacker-news.firebaseio.com/v0/topstories.json' | jq -r '.[0:30][]')
+
+          HN_RAW="/tmp/hn_raw.json"
+          echo "[" > "$HN_RAW"
+          FIRST=true
+          for id in $TOP_IDS; do
+            ITEM=$(curl -s "https://hacker-news.firebaseio.com/v0/item/${id}.json")
+            if [ "$FIRST" = true ]; then FIRST=false; else echo "," >> "$HN_RAW"; fi
+            echo "$ITEM" >> "$HN_RAW"
+            sleep 0.05  # 温和限速
+          done
+          echo "]" >> "$HN_RAW"
+
+          # 清洗：提取标题、URL、分数、评论数
+          jq -r '
+            [.[] | select(.title != null)]
+            | sort_by(-(.score // 0))
+            | .[0:25]
+            | .[]
+            | "  - [\(.title // "untitled")](\(.url // "https://news.ycombinator.com/item?id=\(.id)")) "
+            | "    ⬆ \(.score // 0) pts | 💬 \(.descendants // 0) comments | 🔗 \(.type // "story")"
+          ' "$HN_RAW" > /tmp/hn_cleaned.md
+
+          HN_COUNT=$(wc -l < /tmp/hn_cleaned.md)
+          echo "📊 抓取到 HN 条目: $HN_COUNT 行"
+          echo "hn_count=$((HN_COUNT / 2))" >> "$GITHUB_OUTPUT"
+
+      - name: 🌐 抓取 Reddit r/MachineLearning 热门
+        id: fetch_reddit
+        continue-on-error: true
+        run: |
+          echo "=== 抓取 Reddit r/MachineLearning Hot 15 ==="
+
+          REDDIT_JSON=$(curl -s -H "User-Agent: AI-Collector/1.0 (GitHub Action)" \
+            'https://www.reddit.com/r/MachineLearning/hot.json?limit=15' 2>/dev/null || echo '{"data":{"children":[]}}')
+
+          echo "$REDDIT_JSON" | jq -r '
+            .data.children
+            | sort_by(-(.data.score // 0))
+            | .[]
+            | "  - [\(.data.title // "untitled")](https://reddit.com\(.data.permalink // "")) "
+            | "    ⬆ \(.data.score // 0) pts | 💬 \(.data.num_comments // 0) comments | 🏷️ \(.data.link_flair_text // "general")"
+          ' > /tmp/reddit_cleaned.md 2>/dev/null || {
+            echo "⚠️ Reddit API 不可用，使用空列表"
+            echo "" > /tmp/reddit_cleaned.md
+          }
+
+          RD_COUNT=$(wc -l < /tmp/reddit_cleaned.md)
+          echo "📊 抓取到 Reddit 条目: $RD_COUNT 行"
+
+      - name: 🌐 抓取 arXiv 最新 AI 论文
+        id: fetch_arxiv
+        continue-on-error: true
+        run: |
+          echo "=== 抓取 arXiv cs.AI 最新论文 ==="
+
+          # arXiv API: 获取最近 cs.AI 分类下的新论文
+          ARXIV_XML=$(curl -s 'http://export.arxiv.org/api/query?search_query=cat:cs.AI&sortBy=submittedDate&sortOrder=descending&max_results=10' 2>/dev/null || echo '')
+
+          if [ -z "$ARXIV_XML" ]; then
+            echo "⚠️ arXiv API 不可用"
+            echo "" > /tmp/arxiv_cleaned.md
+          else
+            # 用 sed 提取标题和链接（简单解析 XML）
+            echo "$ARXIV_XML" | sed -n '
+              /<title>/{
+                s/.*<title>\(.*\)<\/title>.*/  - 📄 **\1**/
+                h
+              }
+              /<id>/{
+                s/.*<id>\(.*\)<\/id>.*/    🔗 \1/
+                H
+                g
+                s/\n/ | /
+                p
+              }
+            ' | head -20 > /tmp/arxiv_cleaned.md 2>/dev/null || echo "" > /tmp/arxiv_cleaned.md
+          fi
+
+          AX_COUNT=$(wc -l < /tmp/arxiv_cleaned.md)
+          echo "📊 抓取到 arXiv 条目: $AX_COUNT 行"
+
+      - name: 🧠 汇总 & 调用 DeepSeek-Chat 一锤子总结
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          TODAY=$(TZ=Asia/Shanghai date '+%Y-%m-%d')
+          TODAY_DISPLAY=$(TZ=Asia/Shanghai date '+%Y年%m月%d日')
+
+          echo "=== 组装原始素材 ==="
+
+          cat > /tmp/raw_feed.md <<RAWEOF
+          # 📡 每日 AI 前沿素材 — ${TODAY_DISPLAY}
+
+          ## 🔥 Hacker News Top Stories
+          $(cat /tmp/hn_cleaned.md)
+
+          ## 🤖 Reddit r/MachineLearning Hot
+          $(cat /tmp/reddit_cleaned.md)
+
+          ## 📚 arXiv cs.AI 最新论文
+          $(cat /tmp/arxiv_cleaned.md)
+          RAWEOF
+
+          TOTAL_LINES=$(wc -l < /tmp/raw_feed.md)
+          echo "📦 原始素材共 ${TOTAL_LINES} 行"
+
+          # ———— 构造 Prompt ————
+          PROMPT=$(cat <<PROMPT_EOF
+          你是一位资深 AI 行业观察者。以下是今天从 Hacker News、Reddit r/MachineLearning
+          和 arXiv 抓取的前沿 AI 相关内容。请做一个 **一锤子精炼总结**，格式如下：
+
+          ## 输出格式（严格遵守）
+
+          ### 🔑 今日三大热点
+          用 3 个要点概括今天最值得关注的趋势/事件，每条 ≤ 80 字。
+
+          ### 📋 精选速览
+          用表格列出 8-12 条最值得关注的项目/论文/讨论，格式：
+          | 标题 | 来源 | 为什么值得关注 |
+          |------|------|----------------|
+          | ... | HN/Reddit/arXiv | 一句话 |
+
+          ### 💡 一句话今日金句
+          用一句有洞察力的话总结今天的 AI 动态。
+
+          ### 🔗 值得深读
+          推荐 3 条最值得点开原文链接的内容（给出标题 + URL）。
+
+          ## 原始素材
+          $(cat /tmp/raw_feed.md)
+          PROMPT_EOF
+          )
+
+          # ———— 调用 DeepSeek-Chat ————
+          echo "🤖 正在调用 deepseek-chat 进行一锤子总结 ..."
+
+          RESPONSE=$(curl -s https://api.deepseek.com/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
+            -d "$(jq -n \
+              --arg content "$PROMPT" \
+              '{
+                model: "deepseek-chat",
+                messages: [
+                  {role: "system", content: "你是一位精炼的 AI 行业观察者，擅长从海量信息中提炼关键趋势。请严格按格式输出。"},
+                  {role: "user", content: $content}
+                ],
+                temperature: 0.5,
+                max_tokens: 2000
+              }')" 2>&1)
+
+          SUMMARY=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+
+          if [ -z "$SUMMARY" ] || [ "$SUMMARY" = "null" ]; then
+            echo "❌ DeepSeek API 返回为空！"
+            echo "原始响应:"
+            echo "$RESPONSE" | head -30
+            exit 1
+          fi
+
+          echo "✅ 总结生成成功 (${#SUMMARY} 字符)"
+
+          # ———— 写入最终文件 ————
+          OUTPUT_DIR="ClaudeSandbox/ai-master-knowledge"
+          mkdir -p "$OUTPUT_DIR"
+
+          OUTPUT_FILE="${OUTPUT_DIR}/${TODAY}.md"
+
+          cat > "$OUTPUT_FILE" <<FILEEOF
+          # 🗞️ AI 前沿快报 — ${TODAY_DISPLAY}
+
+          > 📅 生成时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M') (CST)
+          > 🤖 总结模型：DeepSeek-Chat
+          > 📡 数据来源：Hacker News · Reddit r/MachineLearning · arXiv cs.AI
+
+          ---
+
+          ${SUMMARY}
+
+          ---
+
+          > 💬 本文由 AI Collector Workflow 自动生成，每天 08:00 (北京时间) 更新。
+          > 📂 归档位置：\`ClaudeSandbox/ai-master-knowledge/${TODAY}.md\`
+          FILEEOF
+
+          echo ""
+          echo "📄 文件已生成: $OUTPUT_FILE"
+          echo "📏 文件大小: $(wc -c < "$OUTPUT_FILE") bytes"
+
+      - name: 📤 提交并推送快报
+        run: |
+          TODAY=$(TZ=Asia/Shanghai date '+%Y-%m-%d')
+          OUTPUT_FILE="ClaudeSandbox/ai-master-knowledge/${TODAY}.md"
+
+          if [ ! -f "$OUTPUT_FILE" ]; then
+            echo "❌ 输出文件不存在: $OUTPUT_FILE"
+            exit 1
+          fi
+
+          git config user.name  "AI Collector Bot"
+          git config user.email "collector-bot@ai.master"
+
+          git add "$OUTPUT_FILE"
+
+          if git diff --cached --quiet; then
+            echo "⏭️  无变更，跳过提交。"
+            exit 0
+          fi
+
+          git commit -m "🗞️ 每日 AI 前沿快报 — ${TODAY}
+
+          - 来源: HN · Reddit · arXiv
+          - 模型: deepseek-chat
+          - 归档: ClaudeSandbox/ai-master-knowledge/${TODAY}.md"
+
+          git push origin HEAD
+          echo "🚀 快报已推送！"
