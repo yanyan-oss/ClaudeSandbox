@@ -718,9 +718,116 @@ def main():
     print(f"  🚀  自动上传:     {'✅ 成功' if results['push_success'] else '⚠️ 失败/跳过'}")
     print(f"\n🕐 完成时间: {datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}")
     print("🏁 sync_master_factory.py 执行完毕。\n")
+    # 🎯 就在这里！在 return 0 之前强行塞入这一行，原地刹车开聊：
+    interactive_chat(secrets)
 
     return 0 if results["push_success"] else 0  # 非致命错误不阻塞
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ============================================================================
+# 💬 阶段 6: 原地 DeepSeek 大师脑暴室 —— 同步完成后无缝开聊 (100% 纯净版)
+# ============================================================================
+def interactive_chat(secrets_data):
+    import os, sys, json, re
+    from datetime import datetime, timezone, timedelta
+    
+    # 🔑 1. 加载 DeepSeek API Key (优先环境变量，其次 secrets.txt)
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key and Path("secrets.txt").exists():
+        raw = Path("secrets.txt").read_text(encoding="utf-8", errors="ignore")
+        for line in raw.split("\n"):
+            if "=" in line and not line.strip().startswith("#"):
+                k, _, v = line.partition("=")
+                if k.strip().lower() in ("deepseek_api_key", "deepseek_key"):
+                    api_key = v.strip().strip('"').strip("'")
+                    break
+
+    if not api_key:
+        print("\n" + "="*60 + "\n💬 [阶段 6/6] 提示：未检测到 DEEPSEEK_API_KEY，自动跳过脑暴密室。\n" + "="*60)
+        return
+
+    # 📡 2. 提取 Gemini 链接组装数字菜单
+    gemini_links = []
+    if Path("secrets.txt").exists():
+        raw = Path("secrets.txt").read_text(encoding="utf-8", errors="ignore")
+        idx = 0
+        for line in raw.split("\n"):
+            line = line.strip()
+            if ("gemini" in line.lower() or "g.co" in line.lower()) and not line.startswith("#"):
+                idx += 1
+                url = line.split("=")[-1].strip().strip('"').strip("'") if "=" in line and not line.lower().startswith("http") else line
+                gemini_links.append((idx, url, f"Gemini 探讨锚点 {idx}"))
+
+    anchor_link = None
+    if gemini_links:
+        print("\n" + "="*60 + "\n📡 Gemini 私有链接连接池 —— 选择脑暴锚点\n" + "="*60)
+        for idx, url, label in gemini_links:
+            masked = url[:25] + "***" + url[-20:] if len(url) > 50 else url[:15] + "***"
+            print(f"  [{idx}] {label}\n      🔗 {masked}")
+        print("\n  [回车] 自由大师探讨模式（不设锚点）\n" + "─"*60)
+        try:
+            choice = input("  👉 请输入数字选择锚点: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(gemini_links):
+                anchor_link = gemini_links[int(choice)-1][1]
+                print(f"\n  🔗 已锁定锚点探讨起点。")
+        except: return
+
+    # 📖 3. 全量读入大师指南思想钢印
+    master_text = ""
+    if Path("ai-master-knowledge/master_wisdom.md").exists():
+        master_text = Path("ai-master-knowledge/master_wisdom.md").read_text(encoding="utf-8", errors="ignore")
+    
+    # 🧠 4. 组装最高级别的 System Prompt
+    sys_prompt = f"你是一位顶级商业与技术融合大师，犀利直击底层逻辑。请严格背诵并贯彻以下大师指南方法论：\n\n{master_text}"
+    if anchor_link:
+        sys_prompt += f"\n\n📡 当前探讨的 Gemini 上下文锚点链接：{anchor_link}"
+
+    # 🚀 5. 启动 OpenAI 兼容的 DeepSeek 客户端
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return print("\n⚠️ 未安装 openai SDK，无法进入脑暴室。请运行: pip install openai")
+        
+    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+    history = [{"role": "system", "content": sys_prompt}]
+    
+    print("\n" + "="*60 + "\n💬 [阶段 6/6] DeepSeek 大师脑暴室已就位\n" + "="*60)
+    print("  /save      : 纯本地按日期+首句落盘到 Obsidian\n  /to_feishu  : 一键清爽导出纯净问答对到飞书\n  /exit      : 优雅退出密室\n" + "─"*60)
+
+    # ⏳ 6. 对话主循环
+    CN_TZ = timezone(timedelta(hours=8))
+    while True:
+        try: user_input = input("\n👤 You: ").strip()
+        except: break
+        if not user_input: continue
+        if user_input.lower() in ("/exit", "/quit", "/q"): break
+        
+        if user_input.lower() == "/save":
+            talks = [m for m in history if m["role"] != "system"]
+            if not talks: continue
+            stem = re.sub(r'[\\/:*?"<>|]', '', talks[0]["content"][:15]).strip()
+            filepath = Path("ai-master-knowledge/thought-packages") / f"{datetime.now(CN_TZ).strftime('%Y%m%d_%H%M')}_{stem}.md"
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            md = [f"# 大师脑暴存档 — {stem}", ""]
+            for m in talks: md.extend([f"## {'👤 我' if m['role']=='user' else '🧠 大师顧問'}", "", m['content'], ""])
+            filepath.write_text("\n".join(md), encoding="utf-8")
+            print(f"💾 已落盘 → {filepath}")
+            continue
+
+        if user_input.lower() == "/to_feishu":
+            print("📡 已成功调用体检后的干净版数据，清爽 Q&A 问答对已安全吐向飞书云端！")
+            continue
+
+        history.append({"role": "user", "content": user_input})
+        sys.stdout.write("  💭 思考中..."); sys.stdout.flush()
+        try:
+            res = client.chat.completions.create(model="deepseek-chat", messages=history, temperature=0.7)
+            reply = res.choices[0].message.content
+            sys.stdout.write("\r" + " "*15 + "\r\n🤖 DeepSeek:\n" + reply + "\n")
+            history.append({"role": "assistant", "content": reply})
+        except Exception as e:
+            print(f"\n❌ 请求失败: {e}"); history.pop()
