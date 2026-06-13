@@ -1,40 +1,72 @@
-# 📘 Claude Code 官方使用指南
+# Claude Code
 
-> 来源：[Anthropic Official](https://docs.anthropic.com/en/docs/claude-code)
-> 最后同步：待 sync_master_factory.py 首次运行后自动填充
+![](https://img.shields.io/badge/Node.js-18%2B-brightgreen?style=flat-square) [![npm]](https://www.npmjs.com/package/@anthropic-ai/claude-code)
 
----
+[npm]: https://img.shields.io/npm/v/@anthropic-ai/claude-code.svg?style=flat-square
 
-## 概述
+Claude Code is an agentic coding tool that lives in your terminal, understands your codebase, and helps you code faster by executing routine tasks, explaining complex code, and handling git workflows -- all through natural language commands. Use it in your terminal, IDE, or tag @claude on Github.
 
-Claude Code 是 Anthropic 推出的 AI 编程助手命令行工具，深度集成于终端环境中。
+**Learn more in the [official documentation](https://code.claude.com/docs/en/overview)**.
 
-## 核心能力
+<img src="./demo.gif" />
 
-- **代码生成与编辑**：直接在项目中生成、修改、重构代码
-- **多文件操作**：跨文件的复杂重构和架构调整
-- **Git 集成**：自动创建分支、提交、创建 PR
-- **终端控制**：执行命令、管理进程、调试
-- **上下文理解**：深度理解项目结构和代码库
+## Get started
+> [!NOTE]
+> Installation via npm is deprecated. Use one of the recommended methods below.
 
-## 快速入门
+For more installation options, uninstall steps, and troubleshooting, see the [setup documentation](https://code.claude.com/docs/en/setup).
 
-```bash
-# 安装 Claude Code
-npm install -g @anthropic-ai/claude-code
+1. Install Claude Code:
 
-# 在项目目录启动
-cd your-project
-claude
-```
+    **MacOS/Linux (Recommended):**
+    ```bash
+    curl -fsSL https://claude.ai/install.sh | bash
+    ```
 
-## 高级技巧
+    **Homebrew (MacOS/Linux):**
+    ```bash
+    brew install --cask claude-code
+    ```
 
-- 使用 `/skill` 指令加载领域专用技能
-- 通过 CLAUDE.md 文件注入项目级系统提示
-- 利用 Memory 系统跨会话保持上下文
+    **Windows (Recommended):**
+    ```powershell
+    irm https://claude.ai/install.ps1 | iex
+    ```
 
----
+    **WinGet (Windows):**
+    ```powershell
+    winget install Anthropic.ClaudeCode
+    ```
 
-<!-- ⚠️ 此文件由 sync_master_factory.py 自动同步 -->
-<!-- 手动编辑会被下次同步覆盖 -->
+    **NPM (Deprecated):**
+    ```bash
+    npm install -g @anthropic-ai/claude-code
+    ```
+
+2. Navigate to your project directory and run `claude`.
+
+## Plugins
+
+This repository includes several Claude Code plugins that extend functionality with custom commands and agents. See the [plugins directory](./plugins/README.md) for detailed documentation on available plugins.
+
+## Reporting Bugs
+
+We welcome your feedback. Use the `/bug` command to report issues directly within Claude Code, or file a [GitHub issue](https://github.com/anthropics/claude-code/issues).
+
+## Connect on Discord
+
+Join the [Claude Developers Discord](https://anthropic.com/discord) to connect with other developers using Claude Code. Get help, share feedback, and discuss your projects with the community.
+
+## Data collection, usage, and retention
+
+When you use Claude Code, we collect feedback, which includes usage data (such as code acceptance or rejections), associated conversation data, and user feedback submitted via the `/bug` command.
+
+### How we use your data
+
+See our [data usage policies](https://code.claude.com/docs/en/data-usage).
+
+### Privacy safeguards
+
+We have implemented several safeguards to protect your data, including limited retention periods for sensitive information, restricted access to user session data, and clear policies against using feedback for model training.
+
+For full details, please review our [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms) and [Privacy Policy](https://www.anthropic.com/legal/privacy).

@@ -21,6 +21,20 @@ import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+# ---- Windows 编码防御：强制 UTF-8 ----
+if sys.platform == "win32":
+    # 修复 GBK 控制台无法打印 emoji / box-drawing 字符的问题
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+    # 设置环境变量，确保 subprocess 也使用 UTF-8
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 # ============================================================================
 # 0. ⚙️  配置区 —— 按需修改
 # ============================================================================
