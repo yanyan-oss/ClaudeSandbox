@@ -724,8 +724,6 @@ def main():
     return 0 if results["push_success"] else 0  # 非致命错误不阻塞
 
 
-if __name__ == "__main__":
-    sys.exit(main())
 
 
 # ============================================================================
@@ -831,3 +829,5 @@ def interactive_chat(secrets_data):
             history.append({"role": "assistant", "content": reply})
         except Exception as e:
             print(f"\n❌ 请求失败: {e}"); history.pop()
+if __name__ == "__main__":
+    sys.exit(main())
