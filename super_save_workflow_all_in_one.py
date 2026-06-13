@@ -51,7 +51,7 @@ from pathlib import Path
 # =========================================================================
 # 【配置区】你的 API 密钥 & 模型参数
 # =========================================================================
-API_KEY = "YOUR_DEEPSEEK_API_KEY"
+API_KEY = "YOUR_DEEPSEEK_API_KEY"  # ⚠️ 请填入你的 DeepSeek API Key
 BASE_URL = "https://api.deepseek.com/v1"
 MODEL_NAME = "deepseek-chat"
 
