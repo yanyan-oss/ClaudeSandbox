@@ -443,12 +443,21 @@ def fetch_master_wisdom():
     if EMAIL_INBOX_FILE.exists():
         print(f"\n  📧 检测到本地邮件源: {EMAIL_INBOX_FILE.name}")
         email_content = _read_file_safe(EMAIL_INBOX_FILE)
-        if email_content.strip():
-            email_fingerprint = email_content[:200].strip()
+
+        # 过滤掉仅含注释/空白的"已消化"文件
+        substantive_lines = [
+            l for l in email_content.split("\n")
+            if l.strip() and not l.strip().startswith("<!--")
+        ]
+        if not substantive_lines:
+            print(f"  📭 邮件源已消化完毕（无实质内容），跳过。")
+        else:
+            substantive_content = "\n".join(substantive_lines)
+            email_fingerprint = substantive_content[:200].strip()
             if email_fingerprint and email_fingerprint not in existing_content:
                 topic = "邮件通讯精华"
                 source_link = f"本地邮件源 ({datetime.now(CN_TZ).strftime('%Y-%m-%d')})"
-                sections = _parse_content_to_sections(email_content, "邮件通讯")
+                sections = _parse_content_to_sections(substantive_content, "邮件通讯")
 
                 formatted = MASTER_TEMPLATE.format(
                     topic=topic,
@@ -469,8 +478,8 @@ def fetch_master_wisdom():
                     )
                 else:
                     print(f"  ✅ 邮件内容已存在，跳过。")
-        else:
-            print(f"  📭 邮件源为空，跳过。")
+            else:
+                print(f"  ✅ 邮件内容已存在，跳过。")
     else:
         print(f"\n  📭 未检测到本地邮件源（{EMAIL_INBOX_FILE.name} 不存在），跳过。")
 
