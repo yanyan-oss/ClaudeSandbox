@@ -717,8 +717,9 @@ def main():
     print(f"  🔐  隐私保护:     {'✅ 已锁定' if results['secrets_loaded'] else '📝 待配置链接'}")
     print(f"  🚀  自动上传:     {'✅ 成功' if results['push_success'] else '⚠️ 失败/跳过'}")
     print(f"\n🕐 完成时间: {datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S CST')}")
-    print("🏁 sync_master_factory.py 执行完毕。\n")
-    # 🎯 就在这里！在 return 0 之前强行塞入这一行，原地刹车开聊：
+    print("🏁 同步流水线执行完毕，正在切入 DeepSeek 大师脑暴室...\n")
+    # 🎯 注入 Gemini 菜单数据 + 原地刹车开聊
+    secrets["_gemini_link_list"] = _load_gemini_links_as_menu()
     interactive_chat(secrets)
 
     return 0 if results["push_success"] else 0  # 非致命错误不阻塞
@@ -727,107 +728,898 @@ def main():
 
 
 # ============================================================================
-# 💬 阶段 6: 原地 DeepSeek 大师脑暴室 —— 同步完成后无缝开聊 (100% 纯净版)
+# 6. 💬  原地 DeepSeek 大师脑暴室 —— Gemini 爬虫 + AI 对话 合一引擎
 # ============================================================================
-def interactive_chat(secrets_data):
-    import os, sys, json, re
-    from datetime import datetime, timezone, timedelta
-    
-    # 🔑 1. 加载 DeepSeek API Key (优先环境变量，其次 secrets.txt)
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if not api_key and Path("secrets.txt").exists():
-        raw = Path("secrets.txt").read_text(encoding="utf-8", errors="ignore")
-        for line in raw.split("\n"):
-            if "=" in line and not line.strip().startswith("#"):
-                k, _, v = line.partition("=")
-                if k.strip().lower() in ("deepseek_api_key", "deepseek_key"):
-                    api_key = v.strip().strip('"').strip("'")
-                    break
 
-    if not api_key:
-        print("\n" + "="*60 + "\n💬 [阶段 6/6] 提示：未检测到 DEEPSEEK_API_KEY，自动跳过脑暴密室。\n" + "="*60)
-        return
+import re as _re_module
+import html as _html_module
+import urllib.error as _urllib_error
 
-    # 📡 2. 提取 Gemini 链接组装数字菜单
-    gemini_links = []
-    if Path("secrets.txt").exists():
-        raw = Path("secrets.txt").read_text(encoding="utf-8", errors="ignore")
-        idx = 0
+# ---- 6a. 对话配置 ----
+CHAT_CONFIG = {
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
+    "max_tokens": 8192,
+    "temperature": 0.7,
+    "max_history_turns": 40,
+    "stream": True,
+}
+
+THOUGHT_PACKAGES_DIR = KNOWLEDGE_DIR / "thought-packages"
+
+
+# ---- 6b. Gemini 分享链接全自动爬取解析引擎 ----
+
+def _scrape_gemini_share(url):
+    """
+    【核心引擎】请求 gemini.google.com/share/... 页面，
+    从 HTML 中提取完整对话文本（用户提问 + Gemini 回复）。
+
+    多策略解析（依次尝试，任一成功即返回）：
+      策略 A — 从 __NEXT_DATA__ / JSON-LD / <script> 标签中提取结构化对话数据
+      策略 B — 从 <title> + meta description 提取摘要
+      策略 C — 从可见文本区域 regex 提取对话块
+      策略 D — 返回页面纯文本作为回退
+
+    返回: (success: bool, conversation_text: str)
+    """
+    if not url:
+        return False, ""
+
+    # 规范化 URL：确保是完整的 gemini.google.com 分享链接
+    url = url.strip()
+    if not url.startswith("http"):
+        url = "https://" + url.lstrip("/")
+
+    # 发送 HTTP GET，伪装成浏览器
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw_html = resp.read().decode("utf-8", errors="replace")
+    except _urllib_error.HTTPError as e:
+        return False, "(HTTP {0} — 链接可能已失效或为私有链接)".format(e.code)
+    except _urllib_error.URLError as e:
+        return False, "(网络错误: {0})".format(str(e.reason)[:80])
+    except Exception as e:
+        return False, "(抓取异常: {0})".format(str(e)[:100])
+
+    if not raw_html or len(raw_html) < 200:
+        return False, "(页面内容过短，无法解析)"
+
+    # ========== 策略 A：结构化 JSON 数据提取 ==========
+    # Gemini share 页面的对话数据通常嵌入在 <script> 标签中
+    # 尝试多种 JSON 提取模式
+
+    json_blobs = []
+
+    # A1: __NEXT_DATA__ (Next.js SSR 页面)
+    for match in _re_module.finditer(
+        r'<script[^>]*id="__NEXT_DATA__"[^>]*type="application/json"[^>]*>(.*?)</script>',
+        raw_html, _re_module.DOTALL
+    ):
+        try:
+            data = json.loads(match.group(1))
+            json_blobs.append(("next_data", data))
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # A2: 任意 type="application/json" 的 script 标签
+    for match in _re_module.finditer(
+        r'<script[^>]*type="application/json"[^>]*>(.*?)</script>',
+        raw_html, _re_module.DOTALL
+    ):
+        try:
+            data = json.loads(match.group(1))
+            if isinstance(data, (dict, list)):
+                json_blobs.append(("json_script", data))
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # A3: window.__DATA__ 或类似 JS 变量赋值
+    for match in _re_module.finditer(
+        r'(?:window\.)?__(?:DATA|STATE|PROPS|INITIAL)__\s*=\s*(\{.*?\});',
+        raw_html, _re_module.DOTALL
+    ):
+        try:
+            data = json.loads(match.group(1))
+            json_blobs.append(("js_var", data))
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # 遍历所有 JSON blob，递归搜索包含对话文本的结构
+    def _extract_conversation_from_json(obj, depth=0):
+        """递归遍历 JSON 对象，查找对话 turns。"""
+        if depth > 15:
+            return None
+        if isinstance(obj, dict):
+            # 检查是否直接包含对话 turns
+            for key in ("turns", "messages", "conversation", "contents", "parts"):
+                if key in obj and isinstance(obj[key], list):
+                    turns_text = _parse_turns_list(obj[key])
+                    if turns_text:
+                        return turns_text
+            # 检查 text/role 模式（OpenAI 兼容格式）
+            if "role" in obj and "content" in obj:
+                role = str(obj.get("role", ""))
+                text = str(obj.get("content", "")) if isinstance(obj.get("content"), str) else ""
+                if text.strip():
+                    return "[{0}]: {1}".format(role, text)
+            # 递归搜索
+            for v in obj.values():
+                result = _extract_conversation_from_json(v, depth + 1)
+                if result:
+                    return result
+        elif isinstance(obj, list):
+            # 尝试将 list 解析为 turns
+            turns_text = _parse_turns_list(obj)
+            if turns_text:
+                return turns_text
+            for item in obj:
+                result = _extract_conversation_from_json(item, depth + 1)
+                if result:
+                    return result
+        return None
+
+    def _parse_turns_list(turns):
+        """将 turns/messages 列表解析为对话文本。"""
+        if not turns or not isinstance(turns, list):
+            return None
+        lines = []
+        for turn in turns:
+            if isinstance(turn, dict):
+                # 多种可能的字段名
+                text = (
+                    turn.get("text") or turn.get("content") or
+                    turn.get("message") or turn.get("description") or ""
+                )
+                # 处理 parts 数组（Gemini 原生格式）
+                if not text and "parts" in turn:
+                    parts = turn["parts"]
+                    if isinstance(parts, list):
+                        part_texts = []
+                        for p in parts:
+                            if isinstance(p, dict):
+                                part_texts.append(str(p.get("text", "")))
+                            elif isinstance(p, str):
+                                part_texts.append(p)
+                        text = " ".join(part_texts)
+                if isinstance(text, str) and text.strip():
+                    role = turn.get("role", turn.get("author", turn.get("speaker", "unknown")))
+                    lines.append("[{0}]: {1}".format(role, text.strip()))
+            elif isinstance(turn, str):
+                lines.append(turn)
+        return "\n\n".join(lines) if lines else None
+
+    for _blob_type, blob in json_blobs:
+        extracted = _extract_conversation_from_json(blob)
+        if extracted and len(extracted) > 50:
+            return True, extracted
+
+    # 如果 JSON 策略部分成功但内容较短，合并所有 blob 的文本
+    if json_blobs:
+        all_texts = []
+        for _bt, blob in json_blobs:
+            t = _extract_conversation_from_json(blob)
+            if t:
+                all_texts.append(t)
+        if all_texts:
+            combined = "\n\n---\n\n".join(all_texts)
+            if len(combined) > 50:
+                return True, combined
+
+    # ========== 策略 B：Meta 标签 + Title 提取 ==========
+    title_text = ""
+    desc_text = ""
+
+    title_match = _re_module.search(r'<title[^>]*>(.*?)</title>', raw_html, _re_module.DOTALL)
+    if title_match:
+        title_text = _html_module.unescape(title_match.group(1).strip())
+        # 去除 " - Gemini" 等后缀
+        title_text = _re_module.sub(r'\s*[-–|]\s*(Gemini|Google).*$', '', title_text, flags=_re_module.IGNORECASE)
+
+    desc_match = _re_module.search(
+        r'<meta[^>]*name="description"[^>]*content="([^"]*)"',
+        raw_html, _re_module.IGNORECASE
+    )
+    if desc_match:
+        desc_text = _html_module.unescape(desc_match.group(1).strip())
+
+    meta_result = ""
+    if title_text:
+        meta_result += "📌 主题: {0}\n".format(title_text)
+    if desc_text:
+        meta_result += "📝 摘要: {0}\n".format(desc_text)
+
+    # ========== 策略 C：从纯文本中提取对话块 ==========
+    # 移除 script/style 标签
+    cleaned = _re_module.sub(
+        r'<(script|style|noscript)[^>]*>.*?</\1>',
+        '', raw_html, flags=_re_module.DOTALL | _re_module.IGNORECASE
+    )
+    # 移除 HTML 标签
+    cleaned = _re_module.sub(r'<[^>]+>', '\n', cleaned)
+    # 解码 HTML 实体
+    cleaned = _html_module.unescape(cleaned)
+    # 合并空白行
+    cleaned = _re_module.sub(r'\n\s*\n+', '\n\n', cleaned)
+    # 去除首尾空白
+    cleaned = cleaned.strip()
+
+    # 尝试提取引号内的对话文本（中英文引号）
+    quoted_texts = _re_module.findall(r'["""]([^"""]{20,})["'']', cleaned)
+    if quoted_texts:
+        quotes_block = "\n\n".join(
+            "💬 {0}".format(q.strip()) for q in quoted_texts[:20]
+        )
+    else:
+        quotes_block = ""
+
+    # ========== 策略 D：返回页面纯文本 ==========
+    # 截取前 8000 字符
+    plain_text = cleaned[:8000] if len(cleaned) > 8000 else cleaned
+
+    # ---- 组合所有策略结果 ----
+    final_parts = []
+    if meta_result:
+        final_parts.append(meta_result.strip())
+    if quotes_block:
+        final_parts.append(quotes_block.strip())
+    if plain_text and not quotes_block:
+        final_parts.append(plain_text.strip())
+
+    if final_parts:
+        combined = "\n\n---\n\n".join(final_parts)
+        if len(combined) > 30:
+            return True, combined
+
+    return False, "(无法从该 Gemini 链接中解析出有效对话内容，请确认链接为公开分享链接)"
+
+
+# ---- 6c. 辅助工具函数 ----
+
+def _load_deepseek_api_key():
+    """优先从环境变量 DEEPSEEK_API_KEY 读取，其次从 secrets.txt。"""
+    env_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    if SECRETS_FILE.exists():
+        raw = SECRETS_FILE.read_text(encoding="utf-8", errors="ignore")
         for line in raw.split("\n"):
             line = line.strip()
-            if ("gemini" in line.lower() or "g.co" in line.lower()) and not line.startswith("#"):
-                idx += 1
-                url = line.split("=")[-1].strip().strip('"').strip("'") if "=" in line and not line.lower().startswith("http") else line
-                gemini_links.append((idx, url, f"Gemini 探讨锚点 {idx}"))
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key_part, _, val_part = line.partition("=")
+                if key_part.strip().lower() in (
+                    "deepseek_api_key", "deepseek_key", "deepseek-api-key"
+                ):
+                    return val_part.strip().strip('"').strip("'")
+            if line.lower().startswith("sk-") and "deepseek" in raw.lower():
+                return line
 
-    anchor_link = None
-    if gemini_links:
-        print("\n" + "="*60 + "\n📡 Gemini 私有链接连接池 —— 选择脑暴锚点\n" + "="*60)
-        for idx, url, label in gemini_links:
-            masked = url[:25] + "***" + url[-20:] if len(url) > 50 else url[:15] + "***"
-            print(f"  [{idx}] {label}\n      🔗 {masked}")
-        print("\n  [回车] 自由大师探讨模式（不设锚点）\n" + "─"*60)
+    return ""
+
+
+def _load_gemini_links_as_menu():
+    """从 secrets.txt 提取所有 Gemini 分享链接，组装为菜单列表。"""
+    if not SECRETS_FILE.exists():
+        return []
+
+    raw = SECRETS_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+    result = []
+    idx = 0
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "gemini" in line.lower() or "g.co/gemini" in line.lower():
+            idx += 1
+            if "=" in line and not line.lower().startswith("http"):
+                label_part, _, url_part = line.partition("=")
+                label = label_part.strip()
+                url = url_part.strip().strip('"').strip("'")
+            else:
+                url = line
+                label = "Gemini 对话锚点 {0}".format(idx)
+            result.append((idx, url, label))
+
+    return result
+
+
+def _load_master_wisdom_text():
+    """全量读取 master_wisdom.md 大师沉淀全文。"""
+    if MASTER_WISDOM_FILE.exists():
+        text = MASTER_WISDOM_FILE.read_text(encoding="utf-8", errors="ignore")
+        if text.strip():
+            return text
+    return "（大师沉淀文件尚未生成。请先确保同步流水线阶段 3 成功摄入大师方法论。）"
+
+
+def _build_system_prompt(anchor_link_url=None, scraped_content=None):
+    """
+    构建 DeepSeek System Prompt。
+    核心：全量注入 master_wisdom.md 大师思想钢印 + Gemini 锚点爬取内容。
+    """
+    master_text = _load_master_wisdom_text()
+
+    anchor_block = ""
+    if anchor_link_url and scraped_content:
+        anchor_block = (
+            "\n## 🔗 当前探讨锚点 — 已从 Gemini 链接爬取完整对话内容\n"
+            "用户选择了以下 Gemini 私有对话作为本次脑暴的上下文锚点：\n"
+            "{0}\n\n"
+            "### 📡 爬取的原始对话内容（全量注入）\n\n"
+            "{1}\n\n"
+            "请深度消化以上锚点内容，与大师方法论融会贯通后展开探讨。\n"
+        ).format(anchor_link_url, scraped_content)
+    elif anchor_link_url:
+        anchor_block = (
+            "\n## 🔗 当前探讨锚点\n"
+            "用户选择了以下 Gemini 对话链接作为探讨锚点：\n{0}\n"
+            "（注意：该链接内容未能成功爬取，请用户手动提供关键信息。）\n"
+        ).format(anchor_link_url)
+
+    prompt = (
+        "你是 sync_master_factory 内置的 DeepSeek 大师级 AI 脑暴顾问，"
+        "运行在用户的 Obsidian 知识库环境中。\n\n"
+        "## 🧠 大师思想钢印 —— 必须内化并贯彻以下方法论\n\n"
+        "{master_wisdom}\n"
+        "{anchor_block}\n"
+        "## 仓库上下文\n"
+        "- 根目录：{vault_root}\n"
+        "- 知识库目录：{knowledge_dir}\n"
+        "- 大师沉淀文件：{master_wisdom_file}\n"
+        "- 脑暴存档目录：{thought_packages_dir}\n\n"
+        "## 行为准则\n"
+        "1. 用中文回复（除非用户用英文提问）。\n"
+        "2. 以大师沉淀中的方法论为最高指导思想，融会贯通后给出洞见。\n"
+        "3. 回答简洁有力，直击要害，敢于提出不同角度甚至反向观点。\n"
+        "4. 支持连续追问和深度展开，像真正的顾问一样主动追问用户未言明的需求。\n"
+        "5. 涉及代码操作时，给出可直接运行的 Python/Bash 代码片段。\n"
+        "6. 绝不泄露 API Key 或隐私配置。\n"
+        "7. 如果你的知识截止日期之前的信息与用户本地知识库矛盾，以用户知识库为准。"
+    ).format(
+        master_wisdom=master_text,
+        anchor_block=anchor_block,
+        vault_root=str(VAULT_ROOT),
+        knowledge_dir=str(KNOWLEDGE_DIR),
+        master_wisdom_file=str(MASTER_WISDOM_FILE),
+        thought_packages_dir=str(THOUGHT_PACKAGES_DIR),
+    )
+
+    return prompt
+
+
+def _call_deepseek_api(client, system_prompt, history, config):
+    """
+    通过 OpenAI SDK 调用 DeepSeek API。
+    支持流式和非流式。返回 assistant 回复文本；失败返回 None。
+    """
+    messages = [{"role": "system", "content": system_prompt}] + history
+
+    try:
+        if config.get("stream", True):
+            print()
+            print("┌" + "─" * 66 + "┐")
+            print("│" + "  🤖 DeepSeek 回复".ljust(66) + "│")
+            print("└" + "─" * 66 + "┘")
+            print()
+
+            stream = client.chat.completions.create(
+                model=config["model"],
+                messages=messages,
+                max_tokens=config["max_tokens"],
+                temperature=config["temperature"],
+                stream=True,
+            )
+
+            full_text_parts = []
+            for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        sys.stdout.write(delta.content)
+                        sys.stdout.flush()
+                        full_text_parts.append(delta.content)
+
+            print()
+            print("─" * 68)
+            return "".join(full_text_parts)
+
+        else:
+            sys.stdout.write("  💭 思考中...")
+            sys.stdout.flush()
+
+            response = client.chat.completions.create(
+                model=config["model"],
+                messages=messages,
+                max_tokens=config["max_tokens"],
+                temperature=config["temperature"],
+                stream=False,
+            )
+
+            sys.stdout.write("\r" + " " * 30 + "\r")
+            sys.stdout.flush()
+
+            print()
+            print("┌" + "─" * 66 + "┐")
+            print("│" + "  🤖 DeepSeek 回复".ljust(66) + "│")
+            print("└" + "─" * 66 + "┘")
+            print()
+
+            text = ""
+            if response.choices and len(response.choices) > 0:
+                msg = response.choices[0].message
+                if msg and msg.content:
+                    text = msg.content
+                    print(text)
+
+            print()
+            print("─" * 68)
+            return text
+
+    except Exception as e:
+        sys.stdout.write("\r" + " " * 30 + "\r")
+        sys.stdout.flush()
+        error_msg = str(e)
+        if "401" in error_msg or "auth" in error_msg.lower():
+            print("\n  🔐 DeepSeek API Key 无效或过期。")
+        elif "429" in error_msg or "rate" in error_msg.lower():
+            print("\n  ⏳ API 速率限制，请稍后重试。")
+        elif "402" in error_msg or "insufficient" in error_msg.lower() or "balance" in error_msg.lower():
+            print("\n  💰 DeepSeek 账户余额不足，请充值。")
+        elif "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+            print("\n  🌐 网络连接异常: {0}".format(error_msg[:200]))
+        else:
+            print("\n  ❌ API 调用异常: {0}".format(error_msg[:300]))
+        return None
+
+
+def _extract_first_sentence(text):
+    """从文本中提取第一句有意义的话，用作文件名主干。最长 60 字符。"""
+    if not text:
+        return "untitled"
+    clean = text.strip()
+    cutoff = len(clean)
+    for sep in ("。", "？", "！", ".", "?", "!", "\n"):
+        pos = clean.find(sep)
+        if pos > 0 and pos < cutoff:
+            cutoff = pos
+    result = clean[:cutoff].strip()
+    unsafe_chars = r'<>:"/\|?*'
+    for ch in unsafe_chars:
+        result = result.replace(ch, "")
+    result = result.strip()
+    if len(result) > 60:
+        result = result[:60]
+    return result if result else "untitled"
+
+
+def _estimate_tokens(text):
+    """粗略估算 token 数量。"""
+    if not text:
+        return 0
+    chinese_chars = sum(1 for c in text if '一' <= c <= '鿿' or '㐀' <= c <= '䶿')
+    other_chars = len(text) - chinese_chars
+    return int(chinese_chars / 1.5 + other_chars / 4)
+
+
+def _trim_history(history, max_turns):
+    """保留最近 max_turns 轮对话，超出截断。"""
+    max_messages = max_turns * 2
+    if len(history) <= max_messages:
+        return history
+    removed = (len(history) - max_messages) // 2
+    print("\n  📜 (已自动截断 {0} 轮早期对话以控制上下文长度)\n".format(removed))
+    return history[-max_messages:]
+
+
+def _export_clean_messages(history):
+    """从对话历史提取纯净 Q&A 对（不含 system prompt）。返回 (md_text, feishu_text)。"""
+    lines = [
+        "# 💬 DeepSeek 大师脑暴对话记录",
+        "",
+        "> 导出时间: {0}".format(datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M CST")),
+        "",
+    ]
+
+    qa_pairs = []
+    i = 0
+    while i < len(history):
+        user_msg = None
+        assistant_msg = None
+        if i < len(history) and history[i]["role"] == "user":
+            user_msg = history[i]
+            i += 1
+        if i < len(history) and history[i]["role"] == "assistant":
+            assistant_msg = history[i]
+            i += 1
+
+        if user_msg:
+            q_num = len(qa_pairs) + 1
+            lines.append("---")
+            lines.append("")
+            lines.append("### ❓ Q{0}".format(q_num))
+            lines.append("")
+            lines.append(user_msg["content"])
+            lines.append("")
+
+            if assistant_msg:
+                lines.append("### 💡 A{0}".format(q_num))
+                lines.append("")
+                lines.append(assistant_msg["content"])
+                lines.append("")
+
+            qa_pairs.append({
+                "q": user_msg["content"],
+                "a": assistant_msg["content"] if assistant_msg else "(未回复)",
+            })
+
+    md_text = "\n".join(lines)
+
+    total = len(qa_pairs)
+    feishu_title = "## 💬 DeepSeek 大师脑暴对话\n"
+    feishu_summary = "共 {0} 轮问答\n\n".format(total)
+    feishu_body = ""
+    recent = qa_pairs[-3:] if total > 3 else qa_pairs
+    for pair in recent:
+        q_idx = qa_pairs.index(pair) + 1
+        feishu_body += "**Q{0}**: {1}\n\n**A{0}**: {2}\n\n---\n\n".format(
+            q_idx, pair["q"][:200], pair["a"][:300]
+        )
+    feishu_full = feishu_title + feishu_summary + feishu_body
+
+    return md_text, feishu_full
+
+
+def _send_to_feishu_webhook(content):
+    """通过飞书 Webhook 推送卡片消息。"""
+    webhook_url = os.environ.get("FEISHU_WEBHOOK_URL", "").strip()
+
+    if not webhook_url and SECRETS_FILE.exists():
+        raw = SECRETS_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+        for line in raw.split("\n"):
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            key_part, _, val_part = line.partition("=")
+            if key_part.strip().lower() in (
+                "feishu_webhook", "feishu_webhook_url", "feishu-webhook"
+            ):
+                webhook_url = val_part.strip().strip('"').strip("'")
+                break
+
+    if not webhook_url:
+        return False, (
+            "未配置飞书 Webhook URL。"
+            "请在 secrets.txt 中添加 feishu_webhook=https://open.feishu.cn/open-apis/bot/v2/hook/..."
+        )
+
+    try:
+        payload = json.dumps({
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": "DeepSeek 大师脑暴对话"},
+                    "template": "blue",
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": content[:3000],
+                    }
+                ],
+            },
+        }, ensure_ascii=False).encode("utf-8")
+
+        req = urllib.request.Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                return True, "飞书推送成功！"
+            else:
+                return False, "飞书推送返回 HTTP {0}".format(resp.status)
+    except Exception as e:
+        return False, "飞书推送失败: {0}".format(str(e)[:100])
+
+
+def _handle_slash_command(cmd_line, history, config):
+    """
+    处理三大核心指令 + 辅助指令。
+    返回 (handled: bool, should_exit: bool, message: str)
+    """
+    parts = cmd_line.strip().split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd in ("/exit", "/quit", "/q"):
+        return True, True, "👋 大师脑暴密室已关闭。知识已沉淀，下次见！"
+
+    if cmd == "/save":
+        if not history:
+            return True, False, "📭 当前无对话可保存。"
+        THOUGHT_PACKAGES_DIR.mkdir(parents=True, exist_ok=True)
+        first_user = ""
+        for msg in history:
+            if msg["role"] == "user":
+                first_user = msg["content"]
+                break
+        stem = _extract_first_sentence(first_user)
+        date_str = datetime.now(CN_TZ).strftime("%Y%m%d_%H%M")
+        filename = "{0}_{1}.md".format(date_str, stem)
+        filepath = THOUGHT_PACKAGES_DIR / filename
+        md_text, _ = _export_clean_messages(history)
+        filepath.write_text(md_text, encoding="utf-8")
+        return True, False, "💾 对话已落盘 → {0}".format(filepath.relative_to(VAULT_ROOT))
+
+    if cmd == "/to_feishu":
+        if not history:
+            return True, False, "📭 当前无对话可导出。"
+        md_text, feishu_text = _export_clean_messages(history)
+        THOUGHT_PACKAGES_DIR.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now(CN_TZ).strftime("%Y%m%d_%H%M")
+        feishu_file = THOUGHT_PACKAGES_DIR / "feishu_export_{0}.md".format(date_str)
+        feishu_file.write_text(md_text, encoding="utf-8")
+        ok, msg = _send_to_feishu_webhook(feishu_text)
+        result_lines = [
+            "📋 纯净 Q&A 已导出 → {0}".format(feishu_file.relative_to(VAULT_ROOT)),
+            "📡 飞书推送: {0}".format(msg),
+        ]
+        return True, False, "\n".join(result_lines)
+
+    if cmd == "/model":
+        return True, False, "🎛️  当前模型: {0} (DeepSeek)\nBase URL: {1}".format(
+            config["model"], config["base_url"])
+
+    if cmd == "/temp":
+        if not arg:
+            return True, False, "🌡️  当前 temperature: {0}".format(config["temperature"])
         try:
-            choice = input("  👉 请输入数字选择锚点: ").strip()
-            if choice.isdigit() and 1 <= int(choice) <= len(gemini_links):
-                anchor_link = gemini_links[int(choice)-1][1]
-                print(f"\n  🔗 已锁定锚点探讨起点。")
-        except: return
+            t = float(arg)
+            if 0.0 <= t <= 2.0:
+                config["temperature"] = t
+                return True, False, "✅ temperature 已设为 {0}".format(t)
+            return True, False, "❌ temperature 范围: 0.0 ~ 2.0"
+        except ValueError:
+            return True, False, "❌ 请输入数字，如 /temp 0.5"
 
-    # 📖 3. 全量读入大师指南思想钢印
-    master_text = ""
-    if Path("ai-master-knowledge/master_wisdom.md").exists():
-        master_text = Path("ai-master-knowledge/master_wisdom.md").read_text(encoding="utf-8", errors="ignore")
-    
-    # 🧠 4. 组装最高级别的 System Prompt
-    sys_prompt = f"你是一位顶级商业与技术融合大师，犀利直击底层逻辑。请严格背诵并贯彻以下大师指南方法论：\n\n{master_text}"
-    if anchor_link:
-        sys_prompt += f"\n\n📡 当前探讨的 Gemini 上下文锚点链接：{anchor_link}"
+    if cmd in ("/clear", "/cls"):
+        history.clear()
+        return True, False, "🧹 对话历史已清空。"
 
-    # 🚀 5. 启动 OpenAI 兼容的 DeepSeek 客户端
+    if cmd == "/history":
+        if not history:
+            return True, False, "📭 当前无对话历史。"
+        turns = len(history) // 2
+        lines = ["📜 当前对话 ({0} 轮):".format(turns)]
+        for i, msg in enumerate(history):
+            role = "👤 You" if msg["role"] == "user" else "🤖 DeepSeek"
+            preview = msg["content"][:80].replace("\n", " ")
+            lines.append("  [{0}] {1}: {2}...".format(i, role, preview))
+        return True, False, "\n".join(lines)
+
+    if cmd == "/stream":
+        if arg.lower() in ("off", "false", "0", "no", "关"):
+            config["stream"] = False
+            return True, False, "📝 流式输出已关闭"
+        else:
+            config["stream"] = True
+            return True, False, "🌊 流式输出已开启"
+
+    if cmd in ("/help", "/?"):
+        help_text = (
+            "📋 大师脑暴室指令清单:\n"
+            "  /exit, /quit, /q  —— 优雅退出\n"
+            "  /save             —— 落盘到 thought-packages/\n"
+            "  /to_feishu        —— 纯净 Q&A 导出 + 飞书推送\n"
+            "  /clear, /cls      —— 清空对话历史\n"
+            "  /history          —— 对话摘要\n"
+            "  /model            —— 当前模型\n"
+            "  /temp [值]        —— temperature 调节\n"
+            "  /stream on|off    —— 流式开关\n"
+            "  /help, /?         —— 显示帮助"
+        )
+        return True, False, help_text
+
+    return False, False, ""
+
+
+def _print_gemini_menu(gemini_links):
+    """打印 Gemini 私有链接数字菜单。"""
+    print()
+    print("=" * 60)
+    print("📡  Gemini 私有链接连接池 —— 选择脑暴锚点")
+    print("=" * 60)
+    print()
+    for idx, url, label in gemini_links:
+        if len(url) > 50:
+            masked = url[:25] + "***" + url[-20:]
+        else:
+            masked = url[:15] + "***"
+        print("  [{0}] {1}".format(idx, label))
+        print("      🔗 {0}".format(masked))
+    print()
+    print("  [回车] 自由大师探讨模式（不设锚点）")
+    print("─" * 60)
+
+
+# ---- 6d. 核心对话循环 ----
+
+def interactive_chat(secrets_data):
+    """
+    【DeepSeek 大师脑暴室 —— 完整版】
+    1. 检测 DEEPSEEK_API_KEY
+    2. Gemini 菜单选择探讨锚点 → 爬取链接真实对话内容
+    3. 全量注入 master_wisdom.md 大师思想钢印 + 爬取内容
+    4. 进入多轮对话循环
+    """
+    # ---- 加载 API Key ----
+    api_key = _load_deepseek_api_key()
+
+    if not api_key:
+        print("\n" + "=" * 60)
+        print("💬  [阶段 6/6] DeepSeek 大师脑暴室")
+        print("=" * 60)
+        print()
+        print("  ⚠️  未检测到 DEEPSEEK_API_KEY。")
+        print()
+        print("  配置方法（任选一种）：")
+        print("    1. 设置环境变量: set DEEPSEEK_API_KEY=sk-...")
+        print("    2. 在 secrets.txt 中添加: DEEPSEEK_API_KEY=sk-...")
+        print()
+        print("  💡 配置好后重新运行脚本即可自动进入大师脑暴室。")
+        print("  🏁 sync_master_factory.py 同步流水线执行完毕。\n")
+        return
+
+    # ---- 初始化 OpenAI SDK（指向 DeepSeek） ----
     try:
         from openai import OpenAI
     except ImportError:
-        return print("\n⚠️ 未安装 openai SDK，无法进入脑暴室。请运行: pip install openai")
-        
-    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
-    history = [{"role": "system", "content": sys_prompt}]
-    
-    print("\n" + "="*60 + "\n💬 [阶段 6/6] DeepSeek 大师脑暴室已就位\n" + "="*60)
-    print("  /save      : 纯本地按日期+首句落盘到 Obsidian\n  /to_feishu  : 一键清爽导出纯净问答对到飞书\n  /exit      : 优雅退出密室\n" + "─"*60)
+        print("\n  ⚠️  未安装 openai SDK。请运行: pip install openai")
+        print("  🏁 跳过对话模式，同步流水线已完成。\n")
+        return
 
-    # ⏳ 6. 对话主循环
-    CN_TZ = timezone(timedelta(hours=8))
+    client = OpenAI(api_key=api_key, base_url=CHAT_CONFIG["base_url"])
+
+    # ---- 对话状态 ----
+    history = []
+    chat_config = dict(CHAT_CONFIG)
+
+    # ---- Gemini 菜单 + 爬取 ----
+    gemini_links = secrets_data.get("_gemini_link_list", [])
+    anchor_link_url = None
+    scraped_content = None
+
+    if gemini_links:
+        _print_gemini_menu(gemini_links)
+        try:
+            choice = input("  👉 请输入数字选择锚点（直接回车 = 自由模式）: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n\n  👋 已取消。\n")
+            return
+
+        if choice.isdigit():
+            idx_choice = int(choice)
+            for idx, url, label in gemini_links:
+                if idx == idx_choice:
+                    anchor_link_url = url
+                    print("\n  🔗 已选择锚点 [{0}] {1}".format(idx, label))
+                    break
+            if anchor_link_url is None:
+                print("\n  ⚠️  无效序号，自动进入自由大师探讨模式。")
+        else:
+            print("\n  🕊️  进入自由大师探讨模式。")
+
+    # ---- 如果选择了锚点，爬取 Gemini 链接真实内容 ----
+    if anchor_link_url:
+        print("  🌐 正在爬取 Gemini 链接中的真实对话内容...")
+        ok, content = _scrape_gemini_share(anchor_link_url)
+        if ok:
+            scraped_content = content
+            preview = content[:200].replace("\n", " ")
+            print("  ✅ 爬取成功！获取 {0} 字符对话数据。".format(len(content)))
+            print("  📄 内容预览: {0}...".format(preview))
+        else:
+            print("  ⚠️  爬取失败: {0}".format(content))
+            print("  💡 将仅以链接 URL 作为锚点继续探讨。")
+
+    # ---- 构建 System Prompt ----
+    system_prompt = _build_system_prompt(
+        anchor_link_url=anchor_link_url,
+        scraped_content=scraped_content,
+    )
+
+    # ---- 欢迎界面 ----
+    print()
+    print("=" * 60)
+    print("💬  [阶段 6/6] DeepSeek 大师脑暴室")
+    print("=" * 60)
+    print("""
+  🎛️  模型: {model}
+  🌡️  Temperature: {temp}
+  📜 上下文窗口: 最近 {turns} 轮
+  🌊 流式输出: {stream}
+  🧠 思想钢印: master_wisdom.md 全量注入
+  {anchor_status}
+
+  ⌨️   /help 查看指令  |  /exit 退出密室
+  ──────────────────────────────────────────────────
+""".format(
+        model=chat_config["model"],
+        temp=chat_config["temperature"],
+        turns=chat_config["max_history_turns"],
+        stream="开" if chat_config["stream"] else "关",
+        anchor_status=(
+            "🔗 Gemini 锚点: 已爬取并注入 {0} 字符对话数据".format(len(scraped_content))
+            if scraped_content else
+            "🔗 Gemini 锚点: {0} (未爬取到内容)".format(anchor_link_url)
+            if anchor_link_url else
+            "🕊️  自由探讨模式"
+        ),
+    ))
+
+    # ---- 主循环 ----
     while True:
-        try: user_input = input("\n👤 You: ").strip()
-        except: break
-        if not user_input: continue
-        if user_input.lower() in ("/exit", "/quit", "/q"): break
-        
-        if user_input.lower() == "/save":
-            talks = [m for m in history if m["role"] != "system"]
-            if not talks: continue
-            stem = re.sub(r'[\\/:*?"<>|]', '', talks[0]["content"][:15]).strip()
-            filepath = Path("ai-master-knowledge/thought-packages") / f"{datetime.now(CN_TZ).strftime('%Y%m%d_%H%M')}_{stem}.md"
-            filepath.parent.mkdir(parents=True, exist_ok=True)
-            md = [f"# 大师脑暴存档 — {stem}", ""]
-            for m in talks: md.extend([f"## {'👤 我' if m['role']=='user' else '🧠 大师顧問'}", "", m['content'], ""])
-            filepath.write_text("\n".join(md), encoding="utf-8")
-            print(f"💾 已落盘 → {filepath}")
+        try:
+            user_input = input("  👤 You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n\n  👋 大师脑暴密室已关闭。下次见！\n")
+            break
+
+        if not user_input:
             continue
 
-        if user_input.lower() == "/to_feishu":
-            print("📡 已成功调用体检后的干净版数据，清爽 Q&A 问答对已安全吐向飞书云端！")
-            continue
+        if user_input.startswith("/"):
+            handled, should_exit, message = _handle_slash_command(
+                user_input, history, chat_config
+            )
+            if handled:
+                print("\n  {0}\n".format(message))
+                if should_exit:
+                    break
+                continue
 
         history.append({"role": "user", "content": user_input})
-        sys.stdout.write("  💭 思考中..."); sys.stdout.flush()
-        try:
-            res = client.chat.completions.create(model="deepseek-chat", messages=history, temperature=0.7)
-            reply = res.choices[0].message.content
-            sys.stdout.write("\r" + " "*15 + "\r\n🤖 DeepSeek:\n" + reply + "\n")
-            history.append({"role": "assistant", "content": reply})
-        except Exception as e:
-            print(f"\n❌ 请求失败: {e}"); history.pop()
+
+        assistant_text = _call_deepseek_api(client, system_prompt, history, chat_config)
+
+        if assistant_text is not None:
+            history.append({"role": "assistant", "content": assistant_text})
+            history = _trim_history(history, chat_config["max_history_turns"])
+            total_est = _estimate_tokens(system_prompt) + sum(
+                _estimate_tokens(m["content"]) for m in history
+            )
+            print(
+                "  📊 上下文 ~{0:,} tokens | /save 落盘 | /to_feishu 导出 | /exit 退出"
+                .format(total_est)
+            )
+            print()
+        else:
+            history.pop()
+            print("  💡 API 调用失败，可直接重新输入或 /help 查看指令。\n")
+
+    print("🏁 sync_master_factory.py 全流程完毕。\n")
+
+
+# ============================================================================
+# 🎯 主入口
+# ============================================================================
+
 if __name__ == "__main__":
     sys.exit(main())
