@@ -117,7 +117,8 @@ def run_git(args, capture=True):
 def git_pull_rebase():
     """
     【核心防线】自动 git pull origin main --rebase。
-    从根源死锁代码冲突的可能性 —— 拉取前先变基，拒绝 merge commit。
+    策略：先 stash 本地变更 → rebase → stash pop 恢复，
+    从根源死锁代码冲突的可能性。
     """
     print("\n" + "=" * 60)
     print("🛡️  [阶段 1/5] Git 冲突防御 —— git pull --rebase")
@@ -137,25 +138,64 @@ def git_pull_rebase():
         print(f"⚠️  未配置 origin remote，跳过 pull。")
         return False
 
-    # 先 fetch，再 rebase
+    # 检查是否有未提交的变更，有则先 stash
+    rc, out, err = run_git(["status", "--porcelain"])
+    has_changes = bool(out.strip())
+
+    if has_changes:
+        print("  📦 检测到本地未提交变更，先 git stash 暂存...")
+        rc, out, err = run_git(["stash", "push", "--include-untracked", "-m", "sync_master_factory auto stash"])
+        if rc != 0:
+            print(f"  ⚠️  stash 失败: {err}")
+        else:
+            print(f"  ✅ 已暂存。")
+
+    # fetch remote
     print("  📥 git fetch origin main ...")
     rc, out, err = run_git(["fetch", "origin", "main"])
     if rc != 0:
         print(f"  ⚠️  fetch 失败（网络问题？）: {err}")
+        _pop_stash_if_needed(has_changes)
         print("  ⏭️  跳过同步，继续本地流程。")
         return False
 
-    print("  🔄 git rebase origin/main ...")
+    # 检查本地是否落后于远程
+    rc, behind_out, err = run_git(["rev-list", "--count", "HEAD..origin/main"])
+    behind_count = int(behind_out) if behind_out.isdigit() else 0
+
+    if behind_count == 0:
+        print("  ✅ 本地已是最新，无需变基。")
+        _pop_stash_if_needed(has_changes)
+        return True
+
+    # 执行 rebase
+    print(f"  🔄 远程领先 {behind_count} 个提交，执行 git rebase origin/main ...")
     rc, out, err = run_git(["rebase", "origin/main"])
     if rc == 0:
         print(f"  ✅ 变基成功！本地已与远程同步。\n  {out}")
+        _pop_stash_if_needed(has_changes)
         return True
     else:
-        # rebase 失败通常意味着有冲突 —— 中止变基，保护本地
+        # rebase 冲突 —— 中止变基，保护本地文件
         print(f"  ⚠️  rebase 冲突！自动执行 git rebase --abort 保护本地文件。")
         run_git(["rebase", "--abort"])
         print(f"  📋 冲突详情: {err}")
+        _pop_stash_if_needed(has_changes)
         return False
+
+
+def _pop_stash_if_needed(has_changes):
+    """如果之前 stash 了，恢复 stash。"""
+    if not has_changes:
+        return
+    rc, out, err = run_git(["stash", "list"])
+    if "sync_master_factory auto stash" in out:
+        print("  📤 恢复暂存的本地变更 (git stash pop)...")
+        rc, out2, err2 = run_git(["stash", "pop"])
+        if rc == 0:
+            print("  ✅ 本地变更已恢复。")
+        else:
+            print(f"  ⚠️  stash pop 失败（可能有冲突，请手动处理）: {err2}")
 
 
 # ============================================================================

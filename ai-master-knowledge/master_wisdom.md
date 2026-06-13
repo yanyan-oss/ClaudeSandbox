@@ -456,3 +456,20 @@ for removal instructions.
 
 ## 3. 工具特异性操作指南 (Tool-Specific Guide)
 * 持续收集中，来源：邮件通讯
+
+
+---
+<!-- ⬆️  2026-06-13 09:15 CST 自动摄入 -->
+
+# 🏆 大师级 AI 协同方法论：邮件通讯精华
+
+> 来源：本地邮件源 (2026-06-13)
+
+## 1. 核心思维模型 (Core Mental Models)
+<!-- 已于 2026-06-13 09:14 摄入 -->
+
+## 2. 独门 Prompt 技巧与高级指令 (Advanced Prompting Techniques)
+* 持续收集中，来源：邮件通讯
+
+## 3. 工具特异性操作指南 (Tool-Specific Guide)
+* 持续收集中，来源：邮件通讯
