@@ -12,7 +12,18 @@ The user intends to build a **web-based PPT (slides)** using **Reveal.js** withi
 
 ## Git
 
-`.gitignore` currently ignores everything (`*`) — this means no files are tracked by git. Adjust as needed when adding project files.
+- Remote: `origin` → `https://github.com/yanyan-oss/ClaudeSandbox` (private)
+- Branch: `main`
+- `.gitignore` 精准屏蔽：外部克隆项目、超大文件、个人配置、`secrets.txt`
+- 自动化同步：`sync_master_factory.py` 全自动 pull/push 闭环
+
+## Key Scripts
+
+| 脚本 | 功能 |
+|------|------|
+| `sync_master_factory.py` | 全自动同步工厂：Git 防御 → 指南覆盖 → 沉淀抓取 → 隐私保护 → 一键推送 |
+| `super_save_workflow.py` | 小鹅通直播回放全自动处理管道（ASR + LLM） |
+| `skill-manager.js` | 技能调度核心 |
 
 ## Obsidian
 
